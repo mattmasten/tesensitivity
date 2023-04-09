@@ -17,7 +17,8 @@
 
 {p 8 17 2}
 {cmd:tesensitivity cpi}
-({it:{help varname:ovar} {help varlist:omvarlist}}) ({it:{help varname:tvar} {help varlist:tmvarlist}})
+({it:{help varname:ovar} {help varlist:omvarlist}}[{cmd:,} {opt inter:action}])
+({it:{help varname:tvar} {help varlist:tmvarlist}})
 {ifin}
 [{cmd:,} 
 {it:{help tesensitivity_cpi##stat:stat}} {help tesensitivity_cpi##stat_options:stat_options} 
@@ -93,6 +94,11 @@ on conditional c-dependence and the breakdown point see Remarks.
 
 {marker options}{...}
 {title:Options}
+
+{dlgtab:Model}
+
+{phang}
+{opt interaction} specifies that interactions between the treatment and covariates to be included in the outcome model; interactions are not included by default.
 
 {dlgtab:Stat}
 

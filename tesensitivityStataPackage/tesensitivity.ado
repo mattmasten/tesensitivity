@@ -14,7 +14,7 @@ program define tesensitivity, eclass byable(recall)
 	
 	// parse the subcommand
 	gettoken subcommand 0 : 0
-	
+
 	// correct parsing of comma if no space after subcommand
 	if regexm("`subcommand'", ",$"){
 		local subcommand = substr("`subcommand'", 1, strlen("`subcommand'") - 1)
@@ -22,7 +22,7 @@ program define tesensitivity, eclass byable(recall)
 	}
 	
 	if "`subcommand'" == "cscale" {
-	
+
 		_tesen_cscale `0'
 		if "`r(cmax)'" != "" | "`r(cquantile)'" != "" { 
 			_tesen_display, cscale

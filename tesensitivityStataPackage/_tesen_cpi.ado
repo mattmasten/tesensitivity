@@ -71,6 +71,9 @@ program define _tesen_cpi, eclass
 	_parse expand eqn op: anything
 	gettoken ovar omvarlist : eqn_1
 	gettoken tvar tmvarlist : eqn_2
+	gettoken omvarlist qmodel: omvarlist, parse(",")
+	gettoken comma qmodel: qmodel, parse(",")
+	local qmodel: list clean qmodel
 	
 	// check if covariates are the same for both models
 	local covariates_equal : list omvarlist == tmvarlist
@@ -79,6 +82,16 @@ program define _tesen_cpi, eclass
 		di as error "{p}currently, covariates in the outcome and treatment models " ///
 		            "must be the same, will use union of both varlists.{p_end}" ///
 					"{p}covariates used are: `tmvarlist' {p_end}" 
+	}
+	if "`qmodel'" == "inter" {
+		local qmodel "interaction"
+	}
+	local qmodel_spec = ("`qmodel'" == "interaction") | ("`qmodel'" == "")
+	if ~`qmodel_spec' {
+		local qmodel ""
+		di as text "{p}need to indicate whether to include interactions between " ///
+					"the treatment and covariates in the linear quantile regression.{p_end}" ///
+					"{p}set to default, interaction terms are not included.{p_end}"
 	}
 	
 	// parse variables	
@@ -100,6 +113,24 @@ program define _tesen_cpi, eclass
 	// process verbose + debug option
 	local verbose = "`verbose'" != ""
 	local debug = "`debug'" != ""
+
+	// process the specification of q(x,w) for the linear quantile regression
+	if "`qmodel'" == "interaction" {
+		fvrevar c.`X'#c.(`W')
+		local qmvarlist `W' `r(varlist)'
+		local nvars = 2*`K' + 2 // treatment + covariates + treatment*covariates + intercept
+		if `debug' {
+			di "covariates are `W'"
+			di "full varlist is `qmvarlist'"
+		}		
+	}
+	else if "`qmodel'" == "" {
+		local qmvarlist `W'
+		local nvars = `K' + 2 // treatment + covariates + intercept
+		if `debug' {
+			di "full varlist is `qmvarlist'"
+		}	
+	}
 	
 	// process nobreakdown option
 	if "`nobreakdown'" == "nobreakdown"{
@@ -289,7 +320,7 @@ program define _tesen_cpi, eclass
 			tempname coef
 			local x_`j' = -cos((2*`j'-1)*(_pi)/(2*`nodes'))
 			local x_`j' = (`x_`j'' + 1) * (1/2)
-			capture qui qreg `Y' `X' `W' if `touse', quantile(`x_`j'')
+			capture qui qreg `Y' `X' `qmvarlist' if `touse', quantile(`x_`j'')
 			matrix `xnodes' = (nullmat(`xnodes') \ `x_`j'')
 			matrix `coef' = e(b)
 			matrix `ynodes' = (nullmat(`ynodes') \ `coef')
@@ -301,7 +332,7 @@ program define _tesen_cpi, eclass
 		if `debug' {
 			svmat `xnodes', n(xnodes)
 			svmat `ynodes', n(matcol)
-			foreach v of varlist `W'{
+			foreach v of varlist `qmvarlist'{
 				twoway scatter `ynodes'`v' xnodes, msize("vsmall") name("`v'")
 				qui drop `ynodes'`v'
 			}
@@ -311,6 +342,10 @@ program define _tesen_cpi, eclass
 		// Form the pointer array of pchip coeficients
 		mata: pchipcoefs = pchip_all_coef(st_matrix("`xnodes'"), /// 
 										  st_matrix("`ynodes'"), `nvars')
+		// Debugging: show pointer functions
+		if `debug' {
+			mata: pchipcoefs
+		}
 										 
 	}
 	
@@ -325,13 +360,13 @@ program define _tesen_cpi, eclass
 		
 		// approximate quantile coefficients for tau -> 1
 		local tau = 0.01
-		capture qreg `Y' `X' `W' if `touse', quantile(`=1-`tau'')
+		capture qreg `Y' `X' `qmvarlist' if `touse', quantile(`=1-`tau'')
 		matrix `bscoef1' = e(b)
 		if `verbose' nois _dots 0, title(calculating approximate upper limit quantile function) reps(`iterate')
 		forvalues k=1(1)`iterate' {
 			if `verbose' nois _dots `k' 0
 			local tau = `alpha_accel'* `tau'
-			capture qreg `Y' `X' `W' if `touse', quantile(`=1-`tau'')
+			capture qreg `Y' `X' `qmvarlist' if `touse', quantile(`=1-`tau'')
 			mata: mat_eq("`bscoef1'", "e(b)", "check")
 			matrix `bscoef1' = e(b)
 			if `check' == 1 {        
@@ -342,13 +377,13 @@ program define _tesen_cpi, eclass
 
 		// approximate quantile coefficients for tau -> 0
 		local tau = 0.01
-		capture qreg `Y' `X' `W' if `touse', quantile(`tau')
+		capture qreg `Y' `X' `qmvarlist' if `touse', quantile(`tau')
 		matrix `bscoef0' = e(b)
 		if `verbose' nois _dots 0, title(calculating approximate lower limit quantile function) reps(`iterate')
 		forvalues k=1(1)`iterate' {
 			if `verbose' nois _dots `k' 0
 			local tau = `alpha_accel' * `tau'
-			capture qreg `Y' `X' `W' if `touse', quantile(`tau')
+			capture qreg `Y' `X' `qmvarlist' if `touse', quantile(`tau')
 			mata: mat_eq("`bscoef0'", "e(b)", "check")
 			matrix `bscoef0' = e(b)
 			if `check' == 1 {
@@ -378,13 +413,26 @@ program define _tesen_cpi, eclass
 	// 4.4 (Binary ATE: outcome probabilities)
 	// =========================================================================
 	if "`stat'" == "`ate'" & `binary_outcome'{
-		qui logit `Y' `X' `W' if `touse', nolog // Run a logit of Y on (X, W)
+		qui logit `Y' `X' `qmvarlist' if `touse', nolog // Run a logit of Y on (X, W)
 		
 		local nobs : rowsof(`wsupp')
+		local nwsupp : colsof(`wsupp') 
+
+		if "`qmodel'" == "interaction" {
+			mata: xw0 = (J(`nobs', 1, 0), st_matrix("`wsupp'")[,1..(`nwsupp'-1)], ///
+						0 * st_matrix("`wsupp'")[,1..`nwsupp'-1], J(`nobs', 1, 1))
+			mata: xw1 = (J(`nobs', 1, 1), st_matrix("`wsupp'")[,1..(`nwsupp'-1)], ///
+						1 * st_matrix("`wsupp'")[,1..`nwsupp'-1], J(`nobs', 1, 1))		
+		}
+		else {
+			mata: xw0 = (J(`nobs', 1, 0), st_matrix("`wsupp'"))
+			mata: xw1 = (J(`nobs', 1, 1), st_matrix("`wsupp'"))		
+		}
+
 		// calculate: \hat{P}(Y=1 | X=1, W=w) = \Lambda( \hat{\beta}' [1 W] )
-		mata: p11 = invlogit((J(`nobs',1,1), st_matrix("`wsupp'")) * st_matrix("e(b)")')
+		mata: p11 = invlogit(xw1 * st_matrix("e(b)")')
 		// calculate: \hat{P}(Y=1 | X=0, W=w) = \Lambda( \hat{\beta}' [0 W] )
-		mata: p10 = invlogit((J(`nobs',1,0), st_matrix("`wsupp'")) * st_matrix("e(b)")')
+		mata: p10 = invlogit(xw0 * st_matrix("e(b)")')
 		mata: st_matrix("`p10'", p10)
 		mata: st_matrix("`p11'", p11)
 		mata: mata drop p10 p11
@@ -427,13 +475,13 @@ program define _tesen_cpi, eclass
 
 	// form arguments for statistic selected (documented below in section A)
 	if "`stat'" == "cqte" {
-		local c_function_args `"`quantile' `p0' `p1' `wsupp' "`bscoef0'" "`bscoef1'" "`Y' `X' `W'" `touse'"'
+		local c_function_args `"`quantile' `p0' `p1' `wsupp' "`bscoef0'" "`bscoef1'" "`Y' `X' `qmvarlist'" `touse'"'
 	}
 	else if "`stat'" == "atet" {
 		local c_function_args `"`p0' `p1' `wsupp' pchipcoefs `nvars' `nobs' `exp_y0' `exp_y1' `up0' `up1'"'
 	}
 	else if "`stat'" == "qte" {
-		local c_function_args `"`quantile' `p0' `p1' `wsupp' `tol' `Y' `X' "`W'" `touse'"'
+		local c_function_args `"`quantile' `p0' `p1' `wsupp' `tol' `Y' `X' "`qmvarlist'" `touse'"'
 	}
 	else if "`stat'" == "ate" & `binary_outcome' {
 		local c_function_args `"`p0' `p1' `p10' `p11'"'
@@ -593,12 +641,28 @@ program define cqte_bounds_c, sclass
 		// select the right covariates for each set of coefficients
 		// odd are treatment, even are control
 		local nobs : rowsof(`wsupp')
-		if mod(`j', 2) == 0{
-			matrix `xw' = (J(`nobs', 1, 0), `wsupp')
-		} 
-		else {
-			matrix `xw' = (J(`nobs', 1, 1), `wsupp')
+		local nwsupp : colsof(`wsupp') // dimension of W, including constant
+
+		// bscoef0 contains constant and X
+		if colsof(`bscoef0')>(`nwsupp'+1){
+			if mod(`j', 2) == 0{
+				matrix `xw' = (J(`nobs', 1, 0), `wsupp'[.,1..`nwsupp'-1], ///
+							  0 * `wsupp'[.,1..`nwsupp'-1], J(`nobs', 1, 1))
+			} 
+			else {
+				matrix `xw' = (J(`nobs', 1, 1), `wsupp'[.,1..`nwsupp'-1], ///
+							  1 * `wsupp'[.,1..`nwsupp'-1], J(`nobs', 1, 1))
+			}	
 		}
+		else {
+			if mod(`j', 2) == 0{
+				matrix `xw' = (J(`nobs', 1, 0), `wsupp')
+			} 
+			else {
+				matrix `xw' = (J(`nobs', 1, 1), `wsupp')
+			}			
+		}
+
 		
 		// calculate the quantile regression if not on the boundary
 		// use the approximate boundary coeficients if not
@@ -776,26 +840,39 @@ end
 //   - touse: (varname) sample flag
 program qte_bounds_c, sclass
 
-	args c qtl p0 p1 wsupp tol Y X W touse
+	args c qtl p0 p1 wsupp tol Y X qmvarlist touse
 	
 	// TODO: the qte auxiliary functions uses these directly from mata global 
 	//       memory - clean this up so they are passed by the functions rather 
 	//       than hanging around in mata global memory
 	local nobs : rowsof(`wsupp')
-	mata: xw0 = (J(`nobs', 1, 0), st_matrix("`wsupp'"))
-	mata: xw1 = (J(`nobs', 1, 1), st_matrix("`wsupp'"))
+	local nwsupp : colsof(`wsupp') // dimension of W, including constant
+	local ncov : word count `qmvarlist'	// dimension of q(X,W), excluding X
+
+	// compare the dimensions to determine whether XW is included
+	if (`ncov'>(`nwsupp'-1)) {
+		mata: xw0 = (J(`nobs', 1, 0), st_matrix("`wsupp'")[,1..(`nwsupp'-1)], ///
+					0 * st_matrix("`wsupp'")[,1..`nwsupp'-1], J(`nobs', 1, 1))
+		mata: xw1 = (J(`nobs', 1, 1), st_matrix("`wsupp'")[,1..(`nwsupp'-1)], ///
+					1 * st_matrix("`wsupp'")[,1..`nwsupp'-1], J(`nobs', 1, 1))		
+	}
+	else {
+		mata: xw0 = (J(`nobs', 1, 0), st_matrix("`wsupp'"))
+		mata: xw1 = (J(`nobs', 1, 1), st_matrix("`wsupp'"))		
+	}
+
 	mata: p0 = st_matrix("`p0'")
 	mata: p1 = st_matrix("`p1'")
 
-    LQ `c' `Y' `X' "`W'" `touse' `tol' `qtl' 0
+    LQ `c' `Y' `X' "`qmvarlist'" `touse' `tol' `qtl' 0
     local LQ0 `s(LQ0)'
-    UQ `c' `Y' `X' "`W'" `touse' `tol' `qtl' 1
+    UQ `c' `Y' `X' "`qmvarlist'" `touse' `tol' `qtl' 1
     local UQ1 `s(UQ1)'
     local UQTE = `UQ1' - `LQ0'
 	
-	LQ `c' `Y' `X' "`W'" `touse' `tol' `qtl' 1
+	LQ `c' `Y' `X' "`qmvarlist'" `touse' `tol' `qtl' 1
     local LQ1 `s(LQ1)'
-    UQ `c' `Y' `X' "`W'" `touse' `tol' `qtl' 0    
+    UQ `c' `Y' `X' "`qmvarlist'" `touse' `tol' `qtl' 0    
     local UQ0 `s(UQ0)'
     local LQTE = `LQ1' - `UQ0'
 	
@@ -905,25 +982,25 @@ end
 // TODO: This should be moved to mata and/or documented
 
 program define UF1, sclass // The upper bound on F_{Y_1}(y)
-    args gridy gridc Y X W touse
+    args gridy gridc Y X qmvarlist touse
 
     // Estimate F_{Y|X,W}(y | x,w)
     tempvar indicatorY
     qui gen `indicatorY' = (`Y' <= `gridy') if `touse' // indicator(Y<=y)
-    qui logit `indicatorY' `X' `W' if `touse', nolog // logit indicator(Y<=y) on (1,X,W)
-    mata: Fy1w = invlogit(xw1 * st_matrix("e(b)")') // coefficient*(X,W,1)
+    qui logit `indicatorY' `X' `qmvarlist' if `touse', iterate(2000) nolog // logit indicator(Y<=y) on (1,X,W) or (1,X,W,XW)
+    mata: Fy1w = invlogit(xw1 * st_matrix("e(b)")') // coefficient*(X,W,1)or(X,W,XW,1)
     mata: UF1W = min3(((p1 :* Fy1w) :/ (p1 :- `gridc')) :* (p1 :> `gridc') + (p1 :<= `gridc'), (p1 :* Fy1w :+ `gridc') :/ (p1 :+ `gridc'), p1 :* Fy1w :+ (1 :- p1))
     mata: st_local("UF1", strofreal(mean(UF1W)))
     sreturn local bound = `UF1'
 end
 
 program define UF0, sclass // The upper bound on F_{Y_0}(y)
-    args gridy gridc Y X W touse
+    args gridy gridc Y X qmvarlist touse
     // Estimate F_{Y|X,W}(y | x,w)
     tempvar indicatorY
     qui gen `indicatorY' = (`Y' <= `gridy') if `touse' // indicator(Y<=y)
-    qui logit `indicatorY' `X' `W' if `touse', nolog // logit indicator(Y<=y) on (1,X,W)
-    mata: Fy0w = invlogit(xw0 * st_matrix("e(b)")') // coefficient*(X,W,1)
+    qui logit `indicatorY' `X' `qmvarlist' if `touse', iterate(2000) nolog // logit indicator(Y<=y) on (1,X,W) or (1,X,W,XW)
+    mata: Fy0w = invlogit(xw0 * st_matrix("e(b)")') // coefficient*(X,W,1)or(X,W,XW,1)
     mata: UF0W = min3(((p0 :* Fy0w) :/ (p0 :- `gridc')) :* (p0 :> `gridc') + (p0 :<= `gridc'), (p0 :* Fy0w :+ `gridc') :/ (p0 :+ `gridc'), p0 :* Fy0w :+ (1 :- p0))
     mata: st_local("UF0", strofreal(mean(UF0W)))
 
@@ -931,33 +1008,33 @@ program define UF0, sclass // The upper bound on F_{Y_0}(y)
 end
  
 program define LF1, sclass // The lower bound on F_{Y_1}(y)
-    args gridy gridc Y X W touse
+    args gridy gridc Y X qmvarlist touse
 
     // Estimate F_{Y|X,W}(y | x,w)
     tempvar indicatorY
     qui gen `indicatorY' = (`Y' <= `gridy') if `touse' // indicator(Y<=y)
-    qui logit `indicatorY' `X' `W' if `touse', nolog // logit indicator(Y<=y) on (1,X,W)
-    mata: Fy1w = invlogit(xw1 * st_matrix("e(b)")') // coefficient*(X,W,1)
+    qui logit `indicatorY' `X' `qmvarlist' if `touse', iterate(2000) nolog // logit indicator(Y<=y) on (1,X,W) or (1,X,W,XW)
+    mata: Fy1w = invlogit(xw1 * st_matrix("e(b)")') // coefficient*(X,W,1) or (X,W,XW,1)
     mata: LF1W = max3((p1 :* Fy1w) :/ (p1 :+ `gridc'), ((p1 :* Fy1w :- `gridc') :/ (p1 :- `gridc')) :* (p1 :> `gridc'),  p1 :* Fy1w)
     mata: st_local("LF1", strofreal(mean(LF1W)))
     sreturn local bound = `LF1'
 end
 
 program define LF0, sclass // The lower bound on F_{Y_0}(y)
-    args gridy gridc Y X W touse
+    args gridy gridc Y X qmvarlist touse
 
     // Estimate F_{Y|X,W}(y | x,w)
     tempvar indicatorY
     qui gen `indicatorY' = (`Y' <= `gridy') if `touse' // indicator(Y<=y)
-    qui logit `indicatorY' `X' `W' if `touse', nolog // logit indicator(Y<=y) on (1,X,W)
-    mata: Fy0w = invlogit(xw0 * st_matrix("e(b)")') // coefficient*(X,W,1)
+    qui logit `indicatorY' `X' `qmvarlist' if `touse', iterate(2000) nolog // logit indicator(Y<=y) on (1,X,W) or (1,X,W,XW)
+    mata: Fy0w = invlogit(xw0 * st_matrix("e(b)")') // coefficient*(X,W,1) or (X,W,XW,1)
     mata: LF0W = max3((p0 :* Fy0w) :/ (p0 :+ `gridc'), ((p0 :* Fy0w :- `gridc') :/ (p0 :- `gridc')) :* (p0 :> `gridc'),  p0 :* Fy0w)
     mata: st_local("LF0", strofreal(mean(LF0W)))
     sreturn local bound = `LF0'
 end
 
 program define UQ, sclass // the upper bound on Q_{Y_x}(tau)
-    args gridc Y X W touse tol tau treat // treat=1 or 0
+    args gridc Y X qmvarlist touse tol tau treat // treat=1 or 0
 
     tempname ymax ymin vecLF
     qui sum `Y' if `touse'
@@ -965,7 +1042,7 @@ program define UQ, sclass // the upper bound on Q_{Y_x}(tau)
     scalar `ymin' = r(min)
     forvalues i = 2(1)9 {
         local y`i' = (`ymax' - `ymin') * (`=`i'-1'/9) + `ymin'
-        LF`treat' `y`i'' `gridc' `Y' `X' "`W'" `touse' // lower bound for F_{Y_x}(y)
+        LF`treat' `y`i'' `gridc' `Y' `X' "`qmvarlist'" `touse' // lower bound for F_{Y_x}(y)
         local LF`treat'`i' `s(bound)'
     }
     local y1 `ymin'
@@ -983,19 +1060,19 @@ program define UQ, sclass // the upper bound on Q_{Y_x}(tau)
     mata: st_local("ylow", strofreal(ylow))
     local yhi = `y`yhi''
     local ylow = `y`ylow''
-    bisection `ylow' `yhi' bound `tol' `tau' LF`treat' `"`gridc' `Y' `X' "`W'" `touse'"'
+    bisection `ylow' `yhi' bound `tol' `tau' LF`treat' `"`gridc' `Y' `X' "`qmvarlist'" `touse'"'
     sreturn local UQ`treat' = `s(output)'
 end
 
 program define LQ, sclass // the lower bound on Q_{Y_x}(tau)
-    args gridc Y X W touse tol tau treat // treat=1 or 0
+    args gridc Y X qmvarlist touse tol tau treat // treat=1 or 0
     tempname ymax ymin vecUF
     qui sum `Y' if `touse'
     scalar `ymax' = r(max)
     scalar `ymin' = r(min)
     forvalues i = 2(1)9 {
         local y`i' = (`ymax' - `ymin') * (`=`i'-1'/9) + `ymin'
-        UF`treat' `y`i'' `gridc' `Y' `X' "`W'" `touse' // lower bound for F_{Y_x}(y)
+        UF`treat' `y`i'' `gridc' `Y' `X' "`qmvarlist'" `touse' // lower bound for F_{Y_x}(y)
         local UF`treat'`i' `s(bound)'
     }
     local y1 `ymin'
@@ -1014,7 +1091,7 @@ program define LQ, sclass // the lower bound on Q_{Y_x}(tau)
     local yhi = `y`yhi''
     local ylow = `y`ylow''
 
-    bisection `ylow' `yhi' bound `tol' `tau' UF`treat' `"`gridc' `Y' `X' "`W'" `touse'"'
+    bisection `ylow' `yhi' bound `tol' `tau' UF`treat' `"`gridc' `Y' `X' "`qmvarlist'" `touse'"'
     sreturn local LQ`treat' = `s(output)'
 end
 
@@ -1145,6 +1222,15 @@ mata:
 
 		int_segs = J(8, 1, .)
 		qtl_coef= J(4, nvars,.)
+		n = rows(cov)
+		if (nvars>(n+2)) {
+			control_cov = (0 \ cov[1..n-1] \ 0 * cov[1..n-1] \ 1)
+			treat_cov = (1 \ cov[1..n-1] \ 1 * cov[1..n-1] \ 1)
+		}
+		else {
+			control_cov = (0 \ cov)
+			treat_cov = (1 \ cov)
+		}
 		
 		// calculate the coeficients and limits
 		limits = qtl_bound(c, p0, p1)
@@ -1172,8 +1258,6 @@ mata:
 		// calculate bounds on CATE
 		if (cate == 1){
 			cate_bounds = J(2,1,.)
-			control_cov = (0 \ cov)
-			treat_cov = (1 \ cov)
 			cate_bounds[1,1] = qtl_coef[1,] * treat_cov - qtl_coef[2,] * control_cov
 			cate_bounds[2,1] = qtl_coef[3,] * treat_cov - qtl_coef[4,] * control_cov
 			return(cate_bounds)
@@ -1181,7 +1265,6 @@ mata:
 		// calculate bounds on CATT
 		if (catt == 1){
 			exp_y0_bounds = J(2,1,.)	
-			control_cov = (0 \ cov)
 			exp_y0_bounds[1,1] = qtl_coef[4,] * control_cov // lower
 			exp_y0_bounds[2,1] = qtl_coef[2,] * control_cov // upper
 			return(exp_y0_bounds)

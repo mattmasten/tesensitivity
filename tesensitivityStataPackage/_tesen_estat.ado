@@ -25,13 +25,14 @@ program define _tesensitivity_estat_summarize
 		
 		// load the variables used in estimation
 		local 0 `e(cmdline)'
-		gettoken 0 : 0, parse(",")
+		gettoken 0 : 0, parse(",") bind
 		syntax anything [if] [in]
 		
 		// parse model specification
 		_parse expand eqn op: anything
 		gettoken ovar omvarlist : eqn_1
 		gettoken tvar tmvarlist : eqn_2
+        gettoken omvarlist qmodel: omvarlist, parse(",")
 					
 		estat_default summarize `ovar' `tvar' `omvarlist'
 
